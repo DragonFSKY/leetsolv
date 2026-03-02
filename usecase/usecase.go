@@ -320,7 +320,7 @@ func (u *QuestionUseCaseImpl) UpsertQuestion(url, note string, familiarity core.
 		return nil, errs.WrapInternalError(err, "Failed to save question store")
 	}
 	if err := u.Storage.SaveDeltas(deltas); err != nil {
-		logger.Errorf("Failed to save deltas: %v", err)
+		return nil, errs.WrapInternalError(err, "Failed to save deltas")
 	}
 	return delta, nil
 }
@@ -367,7 +367,7 @@ func (u *QuestionUseCaseImpl) DeleteQuestion(target string) (*core.Question, err
 		CreatedAt:  u.Clock.Now(),
 	})
 	if err := u.Storage.SaveDeltas(deltas); err != nil {
-		logger.Errorf("Failed to save deltas: %v", err)
+		return nil, errs.WrapInternalError(err, "Failed to save deltas")
 	}
 	return deletedQuestion, nil
 }
@@ -413,7 +413,7 @@ func (u *QuestionUseCaseImpl) Undo() error {
 	// Remove the last delta only after successful undo
 	deltas = deltas[:len(deltas)-1]
 	if err := u.Storage.SaveDeltas(deltas); err != nil {
-		logger.Errorf("Failed to save deltas: %v", err)
+		return errs.WrapInternalError(err, "Failed to save deltas")
 	}
 
 	return nil
@@ -485,18 +485,19 @@ func (u *QuestionUseCaseImpl) GetHistory() ([]core.Delta, error) {
 		return nil, errs.WrapInternalError(err, "Failed to load deltas")
 	}
 
-	// Copy the deltas to avoid modifying the cache
-	reversedDeltas := make([]core.Delta, len(deltas))
-
-	// Reverse the order to show most recent first
-	L, R := 0, len(deltas)-1
-	for L <= R {
-		reversedDeltas[L], reversedDeltas[R] = deltas[R], deltas[L]
-		L++
-		R--
+	// Copy in reverse so that equal timestamps favor later-inserted entries
+	sorted := make([]core.Delta, len(deltas))
+	for i, d := range deltas {
+		sorted[len(deltas)-1-i] = d
 	}
 
-	return reversedDeltas, nil
+	// Stable sort by CreatedAt descending; reversed copy ensures later entries
+	// stay first when timestamps are equal
+	sort.SliceStable(sorted, func(i, j int) bool {
+		return sorted[i].CreatedAt.After(sorted[j].CreatedAt)
+	})
+
+	return sorted, nil
 }
 
 func (u *QuestionUseCaseImpl) appendDelta(deltas []core.Delta, delta core.Delta) []core.Delta {

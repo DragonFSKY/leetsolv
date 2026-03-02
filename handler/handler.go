@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -16,15 +17,26 @@ import (
 	"github.com/eannchen/leetsolv/usecase"
 )
 
+// UpsertNonInteractiveInput holds all parameters for non-interactive upsert.
+type UpsertNonInteractiveInput struct {
+	URL         string
+	Familiarity int // 1-5 (user-friendly)
+	Importance  int // 1-4 (user-friendly)
+	Memory      int // 1-3 (user-friendly)
+	Note        string
+	ParseError  error // if set, report this error instead of executing
+}
+
 type Handler interface {
 	HandleList(scanner *bufio.Scanner)
 	HandleSearch(scanner *bufio.Scanner, args []string)
 	HandleGet(scanner *bufio.Scanner, target string)
 	HandleStatus()
 	HandleUpsert(scanner *bufio.Scanner, rawURL string)
-	HandleDelete(scanner *bufio.Scanner, target string)
-	HandleUndo(scanner *bufio.Scanner)
-	HandleHistory()
+	HandleUpsertNonInteractive(input UpsertNonInteractiveInput)
+	HandleDelete(scanner *bufio.Scanner, target string, skipConfirm bool)
+	HandleUndo(scanner *bufio.Scanner, skipConfirm bool)
+	HandleHistory(args []string)
 	HandleUnknown(command string)
 	HandleHelp()
 	HandleClear()
@@ -33,6 +45,7 @@ type Handler interface {
 	HandleVersion()
 	HandleMigrate(scanner *bufio.Scanner)
 	HandleReset(scanner *bufio.Scanner)
+	SetCLIOptions(opt CLIOptions)
 }
 
 type HandlerImpl struct {
@@ -51,6 +64,51 @@ func NewHandler(cfg *config.Config, questionUseCase usecase.QuestionUseCase, IOH
 	}
 }
 
+func (h *HandlerImpl) SetCLIOptions(opt CLIOptions) {
+	h.IO.SetCLIOptions(opt)
+}
+
+func (h *HandlerImpl) HandleUpsertNonInteractive(input UpsertNonInteractiveInput) {
+	// If there was a parse error, report it
+	if input.ParseError != nil {
+		h.IO.PrintError(errs.WrapValidationError(input.ParseError, input.ParseError.Error()))
+		return
+	}
+
+	// Validate and parse URL
+	parsed, err := urlparser.Parse(input.URL)
+	if err != nil {
+		h.IO.PrintError(err)
+		return
+	}
+
+	// Convert user-friendly values to internal (0-indexed)
+	familiarity := core.Familiarity(input.Familiarity - 1)
+	importance := core.Importance(input.Importance - 1)
+	memory := core.MemoryUse(input.Memory - 1)
+
+	// Call usecase
+	delta, err := h.QuestionUseCase.UpsertQuestion(parsed.NormalizedURL, input.Note, familiarity, importance, memory)
+	if err != nil {
+		h.IO.PrintError(err)
+		return
+	}
+
+	// Output
+	opt := h.IO.GetCLIOptions()
+	if opt.JSON {
+		dto := ToQuestionDTO(delta.NewState)
+		dto.Memory = input.Memory // preserve user-provided memory value
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"action":   string(delta.Action),
+			"question": dto,
+		})
+	} else {
+		h.IO.PrintSuccess(fmt.Sprintf("Question %s", delta.Action.PastTenseString()))
+		h.IO.PrintQuestionUpsertDetail(delta)
+	}
+}
+
 func (h *HandlerImpl) HandleList(scanner *bufio.Scanner) {
 
 	questions, err := h.QuestionUseCase.ListQuestionsOrderByDesc()
@@ -58,6 +116,19 @@ func (h *HandlerImpl) HandleList(scanner *bufio.Scanner) {
 		h.IO.PrintError(err)
 		return
 	}
+
+	opt := h.IO.GetCLIOptions()
+	if opt.JSON {
+		dtos := make([]QuestionDTO, 0, len(questions))
+		for _, q := range questions {
+			dtos = append(dtos, ToQuestionDTO(&q))
+		}
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"questions": dtos,
+		})
+		return
+	}
+
 	if len(questions) == 0 {
 		h.IO.PrintError(errs.ErrNoQuestionsAvailable)
 		return
@@ -67,8 +138,15 @@ func (h *HandlerImpl) HandleList(scanner *bufio.Scanner) {
 }
 
 func (h *HandlerImpl) HandleSearch(scanner *bufio.Scanner, args []string) {
+	opt := h.IO.GetCLIOptions()
+
 	if len(args) == 0 {
-		args = strings.Fields(h.IO.ReadLine(scanner, "Enter search query (or press Enter to search all): "))
+		if opt.JSON {
+			// JSON mode: search-all (equivalent to pressing Enter in interactive)
+			args = []string{}
+		} else {
+			args = strings.Fields(h.IO.ReadLine(scanner, "Enter search query (or press Enter to search all): "))
+		}
 	}
 
 	targets, filterArgs := h.parseSearchQueries(args)
@@ -84,6 +162,18 @@ func (h *HandlerImpl) HandleSearch(scanner *bufio.Scanner, args []string) {
 		h.IO.PrintError(err)
 		return
 	}
+
+	if opt.JSON {
+		dtos := make([]QuestionDTO, 0, len(questions))
+		for _, q := range questions {
+			dtos = append(dtos, ToQuestionDTO(&q))
+		}
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"questions": dtos,
+		})
+		return
+	}
+
 	if len(questions) == 0 {
 		h.IO.PrintError(errs.ErrNoQuestionsAvailable)
 		return
@@ -150,6 +240,16 @@ func (h *HandlerImpl) parseFilterArgs(args []string) (*core.SearchFilter, error)
 }
 
 func (h *HandlerImpl) paginateQuestions(scanner *bufio.Scanner, questions []core.Question) {
+	opt := h.IO.GetCLIOptions()
+
+	// NoPager mode: output all questions without pagination
+	if opt.NoPager {
+		for _, q := range questions {
+			h.IO.PrintQuestionBrief(&q)
+		}
+		return
+	}
+
 	page := 0
 
 	for {
@@ -208,7 +308,12 @@ func (h *HandlerImpl) getQuestionsPage(questions []core.Question, page int) ([]c
 }
 
 func (h *HandlerImpl) HandleGet(scanner *bufio.Scanner, target string) {
+	opt := h.IO.GetCLIOptions()
 	if target == "" {
+		if opt.JSON {
+			h.IO.PrintError(errs.ErrInvalidEmptyInput)
+			return
+		}
 		target = h.IO.ReadLine(scanner, "Enter ID or URL to get the question details: ")
 		if target == "" {
 			h.IO.PrintError(errs.ErrInvalidEmptyInput)
@@ -232,6 +337,14 @@ func (h *HandlerImpl) HandleGet(scanner *bufio.Scanner, target string) {
 		return
 	}
 
+	if opt.JSON {
+		dto := ToQuestionDTO(question)
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"question": dto,
+		})
+		return
+	}
+
 	h.IO.PrintQuestionDetail(question)
 }
 
@@ -239,6 +352,26 @@ func (h *HandlerImpl) HandleStatus() {
 	summary, err := h.QuestionUseCase.ListQuestionsSummary()
 	if err != nil {
 		h.IO.PrintError(err)
+		return
+	}
+
+	opt := h.IO.GetCLIOptions()
+	if opt.JSON {
+		topDue := make([]QuestionDTO, len(summary.TopDue))
+		for i, q := range summary.TopDue {
+			topDue[i] = ToQuestionDTO(&q)
+		}
+		topUpcoming := make([]QuestionDTO, len(summary.TopUpcoming))
+		for i, q := range summary.TopUpcoming {
+			topUpcoming[i] = ToQuestionDTO(&q)
+		}
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"total":          summary.Total,
+			"total_due":      summary.TotalDue,
+			"total_upcoming": summary.TotalUpcoming,
+			"top_due":        topDue,
+			"top_upcoming":   topUpcoming,
+		})
 		return
 	}
 
@@ -282,6 +415,11 @@ func (h *HandlerImpl) HandleStatus() {
 }
 
 func (h *HandlerImpl) HandleUpsert(scanner *bufio.Scanner, rawURL string) {
+	if h.IO.GetCLIOptions().JSON {
+		h.IO.PrintError(errs.WrapValidationError(nil, "use --familiarity and --importance flags for non-interactive mode"))
+		return
+	}
+
 	if rawURL == "" {
 		h.IO.Println("Provided URL will be normalized to a canonical form to match existing data.")
 		h.IO.Println("Supported platforms: LeetCode, HackerRank")
@@ -382,8 +520,14 @@ func (h *HandlerImpl) validateMemoryUse(input string) (core.MemoryUse, error) {
 	return core.MemoryUse(memory - 1), nil
 }
 
-func (h *HandlerImpl) HandleDelete(scanner *bufio.Scanner, target string) {
+func (h *HandlerImpl) HandleDelete(scanner *bufio.Scanner, target string, skipConfirm bool) {
+	opt := h.IO.GetCLIOptions()
+
 	if target == "" {
+		if opt.JSON {
+			h.IO.PrintError(errs.ErrInvalidEmptyInput)
+			return
+		}
 		target = h.IO.ReadLine(scanner, "Enter ID or URL to delete the question: ")
 		if target == "" {
 			h.IO.PrintError(errs.ErrInvalidEmptyInput)
@@ -402,49 +546,123 @@ func (h *HandlerImpl) HandleDelete(scanner *bufio.Scanner, target string) {
 	}
 
 	// Confirm before deleting
-	confirm := strings.ToLower(h.IO.ReadLine(scanner, "Do you want to delete the question? [y/N]: "))
-	if confirm != "y" && confirm != "yes" {
-		h.IO.PrintCancel("Cancelled")
-		h.IO.Printf("\n")
-		return
+	if !skipConfirm {
+		if opt.JSON {
+			h.IO.PrintError(errs.WrapValidationError(nil, "--yes required for non-interactive delete"))
+			return
+		}
+		confirm := strings.ToLower(h.IO.ReadLine(scanner, "Do you want to delete the question? [y/N]: "))
+		if confirm != "y" && confirm != "yes" {
+			h.IO.PrintCancel("Cancelled")
+			h.IO.Printf("\n")
+			return
+		}
 	}
 
-	_, err = h.QuestionUseCase.DeleteQuestion(target)
+	deleted, err := h.QuestionUseCase.DeleteQuestion(target)
 	if err != nil {
 		h.IO.PrintError(err)
+		return
+	}
+
+	if opt.JSON {
+		dto := ToQuestionDTO(deleted)
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"action":   "delete",
+			"question": dto,
+		})
 	} else {
 		h.IO.PrintSuccess("Question Deleted")
+		h.IO.Printf("\n")
 	}
-	h.IO.Printf("\n")
 }
 
-func (h *HandlerImpl) HandleUndo(scanner *bufio.Scanner) {
-	// Confirm before undo
-	confirm := strings.ToLower(h.IO.ReadLine(scanner, "Do you want to undo the previous action? [y/N]: "))
-	if confirm != "y" && confirm != "yes" {
-		h.IO.PrintCancel("Cancelled")
-		h.IO.Printf("\n")
-		return
+func (h *HandlerImpl) HandleUndo(scanner *bufio.Scanner, skipConfirm bool) {
+	opt := h.IO.GetCLIOptions()
+
+	if !skipConfirm {
+		if opt.JSON {
+			h.IO.PrintError(errs.WrapValidationError(nil, "--yes required for non-interactive undo"))
+			return
+		}
+		confirm := strings.ToLower(h.IO.ReadLine(scanner, "Do you want to undo the previous action? [y/N]: "))
+		if confirm != "y" && confirm != "yes" {
+			h.IO.PrintCancel("Cancelled")
+			h.IO.Printf("\n")
+			return
+		}
 	}
 
 	err := h.QuestionUseCase.Undo()
 	if err != nil {
 		h.IO.PrintError(err)
+		return
+	}
+
+	if opt.JSON {
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"message": "undo successful",
+		})
 	} else {
 		h.IO.PrintSuccess("Undo successful")
+		h.IO.Printf("\n")
 	}
-	h.IO.Printf("\n")
 }
 
-func (h *HandlerImpl) HandleHistory() {
+func (h *HandlerImpl) HandleHistory(args []string) {
+	// Parse --limit=N
+	limit := 0
+	for _, arg := range args {
+		if strings.HasPrefix(arg, "--limit=") {
+			val := strings.TrimPrefix(arg, "--limit=")
+			n, parseErr := strconv.Atoi(val)
+			if parseErr != nil || n <= 0 {
+				h.IO.PrintError(errs.WrapValidationError(
+					fmt.Errorf("invalid --limit value: %s", val),
+					fmt.Sprintf("--limit must be a positive integer, got: %s", val),
+				))
+				return
+			}
+			limit = n
+		}
+	}
+
 	deltas, err := h.QuestionUseCase.GetHistory()
 	if err != nil {
 		h.IO.PrintError(err)
 		return
 	}
 
+	fullTotal := len(deltas)
+	if limit > 0 && limit < len(deltas) {
+		deltas = deltas[:limit]
+	}
+
 	if len(deltas) == 0 {
-		h.IO.Println("No history available.")
+		opt := h.IO.GetCLIOptions()
+		if opt.JSON {
+			WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+				"deltas":     []DeltaDTO{},
+				"total":      0,
+				"full_total": fullTotal,
+			})
+		} else {
+			h.IO.Println("No history available.")
+		}
+		return
+	}
+
+	opt := h.IO.GetCLIOptions()
+	if opt.JSON {
+		dtos := make([]DeltaDTO, len(deltas))
+		for i := range deltas {
+			dtos[i] = ToDeltaDTO(&deltas[i])
+		}
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"deltas":     dtos,
+			"total":      len(dtos),
+			"full_total": fullTotal,
+		})
 		return
 	}
 
@@ -493,12 +711,44 @@ func (h *HandlerImpl) HandleHistory() {
 }
 
 func (h *HandlerImpl) HandleSetting(scanner *bufio.Scanner, args []string) {
+	opt := h.IO.GetCLIOptions()
+
 	if len(args) == 0 {
-		// Show current configurable settings
 		registry := h.cfg.GetSettingsRegistry()
+
+		// Sort keys for deterministic output order (R11.2)
+		keys := make([]string, 0, len(registry))
+		for k := range registry {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		if opt.JSON {
+			settings := make([]map[string]any, 0, len(registry))
+			for _, k := range keys {
+				setting := registry[k]
+				value, err := h.cfg.GetSettingValue(setting.Name)
+				if err != nil {
+					continue
+				}
+				settings = append(settings, map[string]any{
+					"name":        setting.Name,
+					"value":       value,
+					"type":        setting.Type,
+					"description": setting.Description,
+				})
+			}
+			WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+				"settings": settings,
+			})
+			return
+		}
+
+		// Show current configurable settings
 		h.IO.PrintfColored(ColorHeader, "Current Settings:\n")
 
-		for _, setting := range registry {
+		for _, k := range keys {
+			setting := registry[k]
 			value, err := h.cfg.GetSettingValue(setting.Name)
 			if err != nil {
 				continue
@@ -511,7 +761,8 @@ func (h *HandlerImpl) HandleSetting(scanner *bufio.Scanner, args []string) {
 		h.IO.PrintlnColored(ColorYellow, "setting <setting_name> <value>")
 		h.IO.Println()
 		h.IO.PrintlnColored(ColorHeader, "Available settings:")
-		for _, setting := range registry {
+		for _, k := range keys {
+			setting := registry[k]
 			h.IO.Printf("  %s (%s): %s\n", setting.Name, setting.Type, setting.Description)
 		}
 
@@ -546,16 +797,50 @@ func (h *HandlerImpl) HandleSetting(scanner *bufio.Scanner, args []string) {
 		return
 	}
 
+	if opt.JSON {
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"setting": settingInfo.Name,
+			"value":   value,
+		})
+		return
+	}
+
 	h.IO.PrintSuccess(fmt.Sprintf("%s set to %v %s", settingInfo.Name, value, settingInfo.Unit))
 	h.IO.Printf("\n")
 }
 
 func (h *HandlerImpl) HandleUnknown(command string) {
-	h.IO.PrintfColored(ColorWarning, "Unknown command: '%s'\n", command)
-	h.IO.PrintfColored(ColorWarning, "Type 'help' or 'h' for more information\n")
+	h.IO.PrintError(errs.WrapValidationError(
+		fmt.Errorf("unknown command: %s", command),
+		fmt.Sprintf("Unknown command: '%s'. Type 'help' for more information", command),
+	))
 }
 
 func (h *HandlerImpl) HandleHelp() {
+	if h.IO.GetCLIOptions().JSON {
+		commands := []map[string]any{
+			{"name": "status", "aliases": []string{"stat"}, "description": "Show question status (total, due, upcoming)"},
+			{"name": "list", "aliases": []string{"ls"}, "description": "List all questions with pagination"},
+			{"name": "search", "aliases": []string{"s"}, "description": "Search questions on URL or note with optional filters"},
+			{"name": "detail", "aliases": []string{"get"}, "description": "Get details of a question by ID or URL"},
+			{"name": "upsert", "aliases": []string{"add"}, "description": "Add or update a question"},
+			{"name": "remove", "aliases": []string{"rm", "delete", "del"}, "description": "Delete a question by ID or URL"},
+			{"name": "undo", "aliases": []string{"back"}, "description": "Undo the last action"},
+			{"name": "history", "aliases": []string{"hist", "log"}, "description": "Show action history"},
+			{"name": "setting", "aliases": []string{"config", "cfg"}, "description": "View and modify application settings"},
+			{"name": "migrate", "aliases": []string{}, "description": "Migrate timestamps to UTC format"},
+			{"name": "reset", "aliases": []string{}, "description": "Delete all questions and history"},
+			{"name": "version", "aliases": []string{"ver", "v"}, "description": "Show version information"},
+			{"name": "help", "aliases": []string{"h"}, "description": "Show this help message"},
+			{"name": "clear", "aliases": []string{"cls"}, "description": "Clear the screen"},
+			{"name": "quit", "aliases": []string{"q", "exit"}, "description": "Exit the application"},
+		}
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"commands": commands,
+		})
+		return
+	}
+
 	h.IO.Printf("\n")
 	h.IO.PrintlnColored(ColorLogo, "░▒▓   LeetSolv — CLI SRS for DSA   ▓▒░")
 	h.IO.PrintfColored(ColorHeader, "\nAvailable Commands:\n")
@@ -581,11 +866,23 @@ func (h *HandlerImpl) HandleHelp() {
 }
 
 func (h *HandlerImpl) HandleClear() {
+	if h.IO.GetCLIOptions().JSON {
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"message": "screen cleared",
+		})
+		return
+	}
 	h.IO.Println("\033[H\033[2J") // Clear screen
 	h.HandleHelp()
 }
 
 func (h *HandlerImpl) HandleQuit() {
+	if h.IO.GetCLIOptions().JSON {
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"message": "goodbye",
+		})
+		return
+	}
 	h.IO.Println("Goodbye!")
 }
 
@@ -616,10 +913,21 @@ func (h *HandlerImpl) getChanges(oldState, newState *core.Question) []string {
 }
 
 func (h *HandlerImpl) HandleVersion() {
+	if h.IO.GetCLIOptions().JSON {
+		WriteJSONSuccess(h.IO.GetWriter(), map[string]any{
+			"version": h.Version,
+		})
+		return
+	}
 	h.IO.Println(h.Version)
 }
 
 func (h *HandlerImpl) HandleMigrate(scanner *bufio.Scanner) {
+	if h.IO.GetCLIOptions().JSON {
+		h.IO.PrintError(errs.WrapValidationError(nil, "migrate requires interactive confirmation"))
+		return
+	}
+
 	h.IO.Println("This will convert all timestamps in your data files to UTC format.")
 	h.IO.Println("This is recommended if you upgraded from a version (v1.0.5 or earlier) that used local timezone.")
 	h.IO.Println("")
@@ -640,6 +948,11 @@ func (h *HandlerImpl) HandleMigrate(scanner *bufio.Scanner) {
 }
 
 func (h *HandlerImpl) HandleReset(scanner *bufio.Scanner) {
+	if h.IO.GetCLIOptions().JSON {
+		h.IO.PrintError(errs.WrapValidationError(nil, "reset requires interactive confirmation"))
+		return
+	}
+
 	h.IO.PrintlnColored(ColorWarning, "⚠️  This will permanently delete ALL your data:")
 	h.IO.Println("    • All questions")
 	h.IO.Println("    • All review history (undo history)")

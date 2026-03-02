@@ -26,6 +26,11 @@ var (
 		{"LEETSOLV_INFO_LOG_FILE", func(e *Config, v string) { e.InfoLogFile = v }},
 		{"LEETSOLV_ERROR_LOG_FILE", func(e *Config, v string) { e.ErrorLogFile = v }},
 		{"LEETSOLV_SETTINGS_FILE", func(e *Config, v string) { e.SettingsFile = v }},
+		{"LEETSOLV_MAX_DELTA", func(e *Config, v string) {
+			if i, err := strconv.Atoi(v); err == nil {
+				e.MaxDelta = i
+			}
+		}},
 		{"LEETSOLV_RANDOMIZE_INTERVAL", func(e *Config, v string) {
 			if b, err := strconv.ParseBool(v); err == nil {
 				e.RandomizeInterval = b
@@ -64,6 +69,27 @@ var (
 					return nil
 				}
 				return errors.New("RandomizeInterval must be a boolean value")
+			},
+		},
+		"maxdelta": {
+			Name:        "MaxDelta",
+			Type:        "int",
+			Description: "Maximum number of history deltas to keep",
+			Validator: func(valueStr string) (any, error) {
+				if intValue, err := strconv.Atoi(valueStr); err == nil {
+					return intValue, nil
+				}
+				return nil, errors.New("MaxDelta must be an integer value")
+			},
+			Getter: func(e *Config) any {
+				return e.MaxDelta
+			},
+			Setter: func(e *Config, value any) error {
+				if intValue, ok := value.(int); ok {
+					e.MaxDelta = intValue
+					return e.validate()
+				}
+				return errors.New("MaxDelta must be an integer value")
 			},
 		},
 		"overduepenalty": {
@@ -139,7 +165,7 @@ func initDefaultConfig() error {
 		},
 		// Delta settings
 		Delta: Delta{
-			MaxDelta: 25,
+			MaxDelta: 500,
 		},
 		// Due Priority List settings
 		DuePriority: DuePriority{

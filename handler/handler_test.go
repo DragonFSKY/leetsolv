@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -28,6 +29,7 @@ type MockIOHandler struct {
 	writeCalls []string
 	lines      []string
 	lineIndex  int
+	opt        CLIOptions
 }
 
 func NewMockIOHandler(input string) *MockIOHandler {
@@ -106,6 +108,26 @@ func (m *MockIOHandler) PrintCancel(message string) {
 func (m *MockIOHandler) FormatTimeAgo(t time.Time) string {
 	// Return a fixed string for deterministic testing
 	return "just now"
+}
+
+func (m *MockIOHandler) SetCLIOptions(opt CLIOptions) {
+	m.opt = opt
+}
+
+func (m *MockIOHandler) LastError() error {
+	return nil
+}
+
+func (m *MockIOHandler) ClearLastError() {
+	// No-op for mock
+}
+
+func (m *MockIOHandler) GetWriter() io.Writer {
+	return m.output
+}
+
+func (m *MockIOHandler) GetCLIOptions() CLIOptions {
+	return m.opt
 }
 
 // MockQuestionUseCase implements QuestionUseCase for testing
@@ -810,7 +832,7 @@ func TestHandler_HandleDelete_Success(t *testing.T) {
 
 	// Simulate user confirmation
 	scanner := bufio.NewScanner(strings.NewReader(""))
-	handler.HandleDelete(scanner, "1")
+	handler.HandleDelete(scanner, "1", false)
 
 	// Verify that deletion message was printed
 	found := false
@@ -831,7 +853,7 @@ func TestHandler_HandleDelete_Cancelled(t *testing.T) {
 	// Simulate user cancellation
 	input := "n\n"
 	scanner := bufio.NewScanner(strings.NewReader(input))
-	handler.HandleDelete(scanner, "1")
+	handler.HandleDelete(scanner, "1", false)
 
 	// Verify that cancellation message was printed
 	found := false
@@ -850,7 +872,7 @@ func TestHandler_HandleDelete_EmptyInput(t *testing.T) {
 	handler, mockIO, _ := setupTestHandler(t)
 
 	scanner := bufio.NewScanner(strings.NewReader("\n"))
-	handler.HandleDelete(scanner, "")
+	handler.HandleDelete(scanner, "", false)
 
 	// Verify that error was printed for empty input
 	found := false
@@ -879,7 +901,7 @@ func TestHandler_HandleDelete_UseCaseError(t *testing.T) {
 
 	// Simulate user confirmation
 	scanner := bufio.NewScanner(strings.NewReader(""))
-	handler.HandleDelete(scanner, "999")
+	handler.HandleDelete(scanner, "999", false)
 
 	// Verify that error was printed
 	found := false
@@ -904,7 +926,7 @@ func TestHandler_HandleUndo_Success(t *testing.T) {
 
 	// Simulate user confirmation
 	scanner := bufio.NewScanner(strings.NewReader(""))
-	handler.HandleUndo(scanner)
+	handler.HandleUndo(scanner, false)
 
 	// Verify that success message was printed
 	found := false
@@ -933,7 +955,7 @@ func TestHandler_HandleUndo_Error(t *testing.T) {
 
 	// Simulate user confirmation
 	scanner := bufio.NewScanner(strings.NewReader(""))
-	handler.HandleUndo(scanner)
+	handler.HandleUndo(scanner, false)
 
 	// Verify that error was printed
 	found := false
@@ -954,7 +976,7 @@ func TestHandler_HandleUndo_Cancelled(t *testing.T) {
 	// Simulate user cancellation
 	input := "n\n"
 	scanner := bufio.NewScanner(strings.NewReader(input))
-	handler.HandleUndo(scanner)
+	handler.HandleUndo(scanner, false)
 
 	// Verify that cancellation message was printed
 	found := false
@@ -1133,16 +1155,22 @@ func TestHandler_HandleUnknown(t *testing.T) {
 
 	handler.HandleUnknown("unknown_command")
 
-	// Verify that warning was printed
+	// Verify that PrintError was called (unknown command now reports a ValidationError)
 	found := false
 	for _, call := range mockIO.writeCalls {
-		if call == "PrintfColored" {
+		if call == "PrintError" {
 			found = true
 			break
 		}
 	}
 	if !found {
-		t.Error("Expected PrintfColored to be called for unknown command")
+		t.Error("Expected PrintError to be called for unknown command")
+	}
+
+	// Verify error message contains the command name
+	output := mockIO.output.String()
+	if !strings.Contains(output, "unknown_command") {
+		t.Errorf("Expected output to mention 'unknown_command', got: %s", output)
 	}
 }
 
@@ -1200,7 +1228,7 @@ func TestHandler_HandleHistory_Success(t *testing.T) {
 	// Set up history data
 	mockUseCase.shouldError = false
 
-	handler.HandleHistory()
+	handler.HandleHistory(nil)
 
 	// Verify that history was displayed
 	output := mockIO.output.String()
@@ -1219,7 +1247,7 @@ func TestHandler_HandleHistory_Error(t *testing.T) {
 	mockUseCase.shouldError = true
 	mockUseCase.errorToReturn = errors.New("test error")
 
-	handler.HandleHistory()
+	handler.HandleHistory(nil)
 
 	// Verify that error was printed
 	found := false
@@ -1579,6 +1607,455 @@ func TestHandler_ExtractQuestionNameFromURL(t *testing.T) {
 			result := handler.extractQuestionNameFromURL(tt.url)
 			if result != tt.expected {
 				t.Errorf("extractQuestionNameFromURL(%q) = %q, want %q", tt.url, result, tt.expected)
+			}
+		})
+	}
+}
+
+// === Fix verification tests (T10-T14) ===
+
+func TestHandler_HandleList_JSON_EmptyDataset(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	// Empty questions list
+	mockUseCase.questions = []core.Question{}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleList(scanner)
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected success:true for empty list, got: %s", output)
+	}
+	if !strings.Contains(output, `"questions":[]`) {
+		t.Errorf("Expected empty questions array, got: %s", output)
+	}
+}
+
+func TestHandler_HandleSearch_JSON_EmptyDataset(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	// Empty search results
+	mockUseCase.questions = []core.Question{}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleSearch(scanner, []string{"nonexistent"})
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected success:true for empty search, got: %s", output)
+	}
+	if !strings.Contains(output, `"questions":[]`) {
+		t.Errorf("Expected empty questions array, got: %s", output)
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls in JSON mode, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleUpsert_JSON_FailFast(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleUpsert(scanner, "")
+
+	// Should call PrintError, not block on ReadLine
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for upsert in JSON mode (fail-fast)")
+	}
+	// Should NOT have called ReadLine
+	for _, call := range mockIO.readCalls {
+		t.Errorf("Unexpected ReadLine call in JSON mode: %s", call)
+	}
+}
+
+func TestHandler_HandleDelete_JSON_WithYes(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	// Set up successful deletion
+	mockUseCase.deleted = &core.Question{
+		ID:  1,
+		URL: "https://leetcode.com/problems/test",
+	}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleDelete(scanner, "1", true) // skipConfirm=true
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success output, got: %s", output)
+	}
+	if !strings.Contains(output, `"action":"delete"`) {
+		t.Errorf("Expected action=delete in output, got: %s", output)
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for delete with --yes, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleDelete_JSON_WithoutYes(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleDelete(scanner, "1", false) // skipConfirm=false, should fail-fast
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for delete without --yes in JSON mode")
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for delete without --yes in JSON mode, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleUndo_JSON_WithYes(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleUndo(scanner, true) // skipConfirm=true
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success output, got: %s", output)
+	}
+	if !strings.Contains(output, `"message":"undo successful"`) {
+		t.Errorf("Expected undo successful message, got: %s", output)
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for undo with --yes, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleUndo_JSON_WithoutYes(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleUndo(scanner, false) // skipConfirm=false, should fail-fast
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for undo without --yes in JSON mode")
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for undo without --yes in JSON mode, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleMigrate_JSON_FailFast(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleMigrate(scanner)
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for migrate in JSON mode")
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for migrate in JSON mode, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleReset_JSON_FailFast(t *testing.T) {
+	mockIO := NewMockIOHandler("")
+	mockIO.SetCLIOptions(CLIOptions{JSON: true, NoColor: true, NoPager: true})
+	mockUseCase := NewMockQuestionUseCase()
+	_, cfg := config.MockEnv(t)
+	logger.InitNop()
+	handler := NewHandler(cfg, mockUseCase, mockIO, "test-version")
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleReset(scanner)
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for reset in JSON mode")
+	}
+	if len(mockIO.readCalls) != 0 {
+		t.Errorf("Expected no ReadLine calls for reset in JSON mode, got %d", len(mockIO.readCalls))
+	}
+}
+
+func TestHandler_HandleHistory_Limit(t *testing.T) {
+	handler, mockIO, mockUseCase := setupTestHandler(t)
+
+	// Return 3 deltas
+	mockUseCase.shouldError = false
+	origGetHistory := mockUseCase.GetHistory
+	_ = origGetHistory
+	// Override: need a mock with 3 deltas. The existing mock returns 1.
+	// We'll test via JSON to verify total/full_total.
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleHistory([]string{"--limit=1"})
+
+	output := mockIO.output.String()
+	// Should have full_total:1 and total:1 (only 1 delta in mock)
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success envelope, got: %s", output)
+	}
+	if !strings.Contains(output, `"full_total":1`) {
+		t.Errorf("Expected full_total:1, got: %s", output)
+	}
+}
+
+func TestHandler_HandleHistory_InvalidLimit(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+
+	handler.HandleHistory([]string{"--limit=abc"})
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for invalid --limit")
+	}
+}
+
+func TestHandler_HandleHistory_ZeroLimit(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+
+	handler.HandleHistory([]string{"--limit=0"})
+
+	found := false
+	for _, call := range mockIO.writeCalls {
+		if call == "PrintError" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("Expected PrintError for --limit=0")
+	}
+}
+
+func TestHandler_HandleHistory_JSON(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleHistory(nil)
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"deltas"`) {
+		t.Errorf("Expected deltas field, got: %s", output)
+	}
+	if !strings.Contains(output, `"total":1`) {
+		t.Errorf("Expected total:1, got: %s", output)
+	}
+	if !strings.Contains(output, `"full_total":1`) {
+		t.Errorf("Expected full_total:1, got: %s", output)
+	}
+}
+
+func TestHandler_HandleVersion_JSON(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleVersion()
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"version":"test-version"`) {
+		t.Errorf("Expected version field, got: %s", output)
+	}
+}
+
+func TestHandler_HandleHelp_JSON(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleHelp()
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"commands"`) {
+		t.Errorf("Expected commands field, got: %s", output)
+	}
+}
+
+func TestHandler_HandleClear_JSON(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleClear()
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"message":"screen cleared"`) {
+		t.Errorf("Expected screen cleared message, got: %s", output)
+	}
+}
+
+func TestHandler_HandleQuit_JSON(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	handler.HandleQuit()
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"message":"goodbye"`) {
+		t.Errorf("Expected goodbye message, got: %s", output)
+	}
+}
+
+func TestHandler_HandleSetting_JSON_ShowSettings(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleSetting(scanner, []string{})
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"settings"`) {
+		t.Errorf("Expected settings field, got: %s", output)
+	}
+}
+
+func TestHandler_HandleSetting_JSON_SetValue(t *testing.T) {
+	handler, mockIO, _ := setupTestHandler(t)
+	mockIO.opt = CLIOptions{JSON: true, NoColor: true, NoPager: true}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	handler.HandleSetting(scanner, []string{"RandomizeInterval", "true"})
+
+	output := mockIO.output.String()
+	if !strings.Contains(output, `"success":true`) {
+		t.Errorf("Expected JSON success, got: %s", output)
+	}
+	if !strings.Contains(output, `"setting"`) {
+		t.Errorf("Expected setting field, got: %s", output)
+	}
+}
+
+func TestSanitizeControlChars_URL(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		contains string
+		excludes string
+	}{
+		{
+			"escape sequence in URL",
+			"https://leetcode.com/\x1b[31mevil",
+			"https://leetcode.com/",
+			"\x1b",
+		},
+		{
+			"bell character in URL",
+			"https://leetcode.com/\x07alert",
+			"https://leetcode.com/",
+			"\x07",
+		},
+		{
+			"clean URL unchanged",
+			"https://leetcode.com/problems/two-sum",
+			"https://leetcode.com/problems/two-sum",
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := sanitizeControlChars(tt.input)
+			if !strings.Contains(result, tt.contains) {
+				t.Errorf("Expected result to contain %q, got %q", tt.contains, result)
+			}
+			if tt.excludes != "" && strings.Contains(result, tt.excludes) {
+				t.Errorf("Expected result to NOT contain %q, got %q", tt.excludes, result)
+			}
+			// Control chars should be replaced with Unicode replacement character
+			if tt.excludes != "" && !strings.ContainsRune(result, '\uFFFD') {
+				t.Errorf("Expected replacement character (U+FFFD) in result, got %q", result)
 			}
 		})
 	}
