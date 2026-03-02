@@ -4,31 +4,38 @@ import (
 	"bufio"
 	"strings"
 	"testing"
+
+	"github.com/eannchen/leetsolv/handler"
 )
 
 // MockHandler implements handler.Handler for testing
 type MockHandler struct {
-	listCalled    bool
-	searchCalled  bool
-	getCalled     bool
-	statusCalled  bool
-	upsertCalled  bool
-	deleteCalled  bool
-	undoCalled    bool
-	helpCalled    bool
-	clearCalled   bool
-	quitCalled    bool
-	historyCalled bool
-	settingCalled bool
-	versionCalled bool
-	migrateCalled bool
-	resetCalled   bool
+	listCalled                 bool
+	searchCalled               bool
+	getCalled                  bool
+	statusCalled               bool
+	upsertCalled               bool
+	upsertNonInteractiveCalled bool
+	deleteCalled               bool
+	undoCalled                 bool
+	helpCalled                 bool
+	clearCalled                bool
+	quitCalled                 bool
+	historyCalled              bool
+	settingCalled              bool
+	versionCalled              bool
+	migrateCalled              bool
+	resetCalled                bool
 
-	searchArgs  []string
-	getArgs     string
-	upsertArgs  string
-	deleteArgs  string
-	settingArgs []string
+	searchArgs               []string
+	getArgs                  string
+	upsertArgs               string
+	upsertNonInteractiveArgs handler.UpsertNonInteractiveInput
+	deleteArgs               string
+	deleteSkipConfirm        bool
+	undoSkipConfirm          bool
+	historyArgs              []string
+	settingArgs              []string
 }
 
 func (m *MockHandler) HandleList(scanner *bufio.Scanner) {
@@ -54,13 +61,15 @@ func (m *MockHandler) HandleUpsert(scanner *bufio.Scanner, rawURL string) {
 	m.upsertArgs = rawURL
 }
 
-func (m *MockHandler) HandleDelete(scanner *bufio.Scanner, target string) {
+func (m *MockHandler) HandleDelete(scanner *bufio.Scanner, target string, skipConfirm bool) {
 	m.deleteCalled = true
 	m.deleteArgs = target
+	m.deleteSkipConfirm = skipConfirm
 }
 
-func (m *MockHandler) HandleUndo(scanner *bufio.Scanner) {
+func (m *MockHandler) HandleUndo(scanner *bufio.Scanner, skipConfirm bool) {
 	m.undoCalled = true
+	m.undoSkipConfirm = skipConfirm
 }
 
 func (m *MockHandler) HandleHelp() {
@@ -75,8 +84,9 @@ func (m *MockHandler) HandleQuit() {
 	m.quitCalled = true
 }
 
-func (m *MockHandler) HandleHistory() {
+func (m *MockHandler) HandleHistory(args []string) {
 	m.historyCalled = true
+	m.historyArgs = args
 }
 
 func (m *MockHandler) HandleSetting(scanner *bufio.Scanner, args []string) {
@@ -84,7 +94,16 @@ func (m *MockHandler) HandleSetting(scanner *bufio.Scanner, args []string) {
 	m.settingArgs = args
 }
 
+func (m *MockHandler) HandleUpsertNonInteractive(input handler.UpsertNonInteractiveInput) {
+	m.upsertNonInteractiveCalled = true
+	m.upsertNonInteractiveArgs = input
+}
+
 func (m *MockHandler) HandleUnknown(command string) {
+	// Not used in command tests
+}
+
+func (m *MockHandler) SetCLIOptions(opt handler.CLIOptions) {
 	// Not used in command tests
 }
 
@@ -303,10 +322,11 @@ func TestStatusCommand_Execute(t *testing.T) {
 	}
 }
 
-func TestUpsertCommand_Execute_WithArgs(t *testing.T) {
+func TestUpsertCommand_Execute_WithURLOnly(t *testing.T) {
 	mockHandler := &MockHandler{}
 	command := &UpsertCommand{Handler: mockHandler}
 
+	// URL only, no flags → interactive mode
 	args := []string{"https://leetcode.com/problems/test"}
 	scanner := bufio.NewScanner(strings.NewReader(""))
 	quit := command.Execute(scanner, args)
@@ -342,6 +362,62 @@ func TestUpsertCommand_Execute_WithoutArgs(t *testing.T) {
 
 	if mockHandler.upsertArgs != "" {
 		t.Errorf("Expected empty URL, got '%s'", mockHandler.upsertArgs)
+	}
+}
+
+func TestUpsertCommand_Execute_NonInteractive(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &UpsertCommand{Handler: mockHandler}
+
+	args := []string{"https://leetcode.com/problems/two-sum", "--familiarity=3", "--importance=2", "--memory=1", "--note=test"}
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	quit := command.Execute(scanner, args)
+
+	if quit {
+		t.Error("UpsertCommand should not return quit=true")
+	}
+
+	if !mockHandler.upsertNonInteractiveCalled {
+		t.Error("Handler.HandleUpsertNonInteractive should have been called")
+	}
+
+	input := mockHandler.upsertNonInteractiveArgs
+	if input.URL != "https://leetcode.com/problems/two-sum" {
+		t.Errorf("Expected URL, got '%s'", input.URL)
+	}
+	if input.Familiarity != 3 {
+		t.Errorf("Expected familiarity=3, got %d", input.Familiarity)
+	}
+	if input.Importance != 2 {
+		t.Errorf("Expected importance=2, got %d", input.Importance)
+	}
+	if input.Memory != 1 {
+		t.Errorf("Expected memory=1, got %d", input.Memory)
+	}
+	if input.Note != "test" {
+		t.Errorf("Expected note='test', got '%s'", input.Note)
+	}
+}
+
+func TestUpsertCommand_Execute_NonInteractive_ParseError(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &UpsertCommand{Handler: mockHandler}
+
+	// Missing required --importance
+	args := []string{"https://leetcode.com/problems/two-sum", "--familiarity=3"}
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	quit := command.Execute(scanner, args)
+
+	if quit {
+		t.Error("UpsertCommand should not return quit=true")
+	}
+
+	if !mockHandler.upsertNonInteractiveCalled {
+		t.Error("HandleUpsertNonInteractive should be called with parse error")
+	}
+
+	if mockHandler.upsertNonInteractiveArgs.ParseError == nil {
+		t.Error("Expected a parse error for missing --importance")
 	}
 }
 
@@ -387,6 +463,38 @@ func TestDeleteCommand_Execute_WithoutArgs(t *testing.T) {
 	}
 }
 
+func TestDeleteCommand_Execute_WithYes(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &DeleteCommand{Handler: mockHandler}
+
+	args := []string{"123", "--yes"}
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	command.Execute(scanner, args)
+
+	if !mockHandler.deleteCalled {
+		t.Error("Handler.HandleDelete should have been called")
+	}
+	if mockHandler.deleteArgs != "123" {
+		t.Errorf("Expected target '123', got '%s'", mockHandler.deleteArgs)
+	}
+	if !mockHandler.deleteSkipConfirm {
+		t.Error("Expected skipConfirm=true with --yes flag")
+	}
+}
+
+func TestDeleteCommand_Execute_WithShortYes(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &DeleteCommand{Handler: mockHandler}
+
+	args := []string{"123", "-y"}
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	command.Execute(scanner, args)
+
+	if !mockHandler.deleteSkipConfirm {
+		t.Error("Expected skipConfirm=true with -y flag")
+	}
+}
+
 func TestUndoCommand_Execute(t *testing.T) {
 	mockHandler := &MockHandler{}
 	command := &UndoCommand{Handler: mockHandler}
@@ -400,6 +508,39 @@ func TestUndoCommand_Execute(t *testing.T) {
 
 	if !mockHandler.undoCalled {
 		t.Error("Handler.HandleUndo should have been called")
+	}
+	if mockHandler.undoSkipConfirm {
+		t.Error("Expected skipConfirm=false without --yes flag")
+	}
+}
+
+func TestUndoCommand_Execute_WithYes(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &UndoCommand{Handler: mockHandler}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	command.Execute(scanner, []string{"--yes"})
+
+	if !mockHandler.undoCalled {
+		t.Error("Handler.HandleUndo should have been called")
+	}
+	if !mockHandler.undoSkipConfirm {
+		t.Error("Expected skipConfirm=true with --yes flag")
+	}
+}
+
+func TestUndoCommand_Execute_WithShortYes(t *testing.T) {
+	mockHandler := &MockHandler{}
+	command := &UndoCommand{Handler: mockHandler}
+
+	scanner := bufio.NewScanner(strings.NewReader(""))
+	command.Execute(scanner, []string{"-y"})
+
+	if !mockHandler.undoCalled {
+		t.Error("Handler.HandleUndo should have been called")
+	}
+	if !mockHandler.undoSkipConfirm {
+		t.Error("Expected skipConfirm=true with -y flag")
 	}
 }
 

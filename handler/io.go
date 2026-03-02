@@ -8,6 +8,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/eannchen/leetsolv/core"
 	"github.com/eannchen/leetsolv/internal/clock"
@@ -54,12 +55,20 @@ type IOHandler interface {
 	PrintError(err error)
 	PrintCancel(message string)
 	FormatTimeAgo(t time.Time) string
+	// CLI automation support
+	SetCLIOptions(opt CLIOptions)
+	LastError() error
+	ClearLastError()
+	GetWriter() io.Writer
+	GetCLIOptions() CLIOptions
 }
 
 type IOHandlerImpl struct {
-	Reader io.Reader
-	Writer io.Writer
-	Clock  clock.Clock
+	Reader  io.Reader
+	Writer  io.Writer
+	Clock   clock.Clock
+	opt     CLIOptions
+	lastErr error
 }
 
 func NewIOHandler(clock clock.Clock) *IOHandlerImpl {
@@ -68,6 +77,26 @@ func NewIOHandler(clock clock.Clock) *IOHandlerImpl {
 		Writer: os.Stdout,
 		Clock:  clock,
 	}
+}
+
+func (ioh *IOHandlerImpl) SetCLIOptions(opt CLIOptions) {
+	ioh.opt = opt
+}
+
+func (ioh *IOHandlerImpl) LastError() error {
+	return ioh.lastErr
+}
+
+func (ioh *IOHandlerImpl) ClearLastError() {
+	ioh.lastErr = nil
+}
+
+func (ioh *IOHandlerImpl) GetWriter() io.Writer {
+	return ioh.Writer
+}
+
+func (ioh *IOHandlerImpl) GetCLIOptions() CLIOptions {
+	return ioh.opt
 }
 
 func (ioh *IOHandlerImpl) Println(a ...interface{}) {
@@ -79,12 +108,20 @@ func (ioh *IOHandlerImpl) Printf(format string, a ...interface{}) {
 }
 
 func (ioh *IOHandlerImpl) PrintlnColored(color string, a ...interface{}) {
+	if ioh.opt.NoColor {
+		ioh.Println(a...)
+		return
+	}
 	fmt.Fprint(ioh.Writer, color)
 	ioh.Println(a...)
 	fmt.Fprint(ioh.Writer, ColorReset)
 }
 
 func (ioh *IOHandlerImpl) PrintfColored(color string, format string, a ...interface{}) {
+	if ioh.opt.NoColor {
+		ioh.Printf(format, a...)
+		return
+	}
 	fmt.Fprint(ioh.Writer, color)
 	ioh.Printf(format, a...)
 	fmt.Fprint(ioh.Writer, ColorReset)
@@ -97,20 +134,20 @@ func (ioh *IOHandlerImpl) ReadLine(scanner *bufio.Scanner, prompt string) string
 }
 
 func (ioh *IOHandlerImpl) PrintQuestionBrief(q *core.Question) {
-	ioh.PrintfColored(ColorQuestionURL, "[%d] %s (Due: %s)\n", q.ID, q.URL, q.NextReview.Local().Format("2006-01-02"))
+	ioh.PrintfColored(ColorQuestionURL, "[%d] %s (Due: %s)\n", q.ID, sanitizeControlChars(q.URL), q.NextReview.Local().Format("2006-01-02"))
 	if q.Note == "" {
 		ioh.Printf(" ↳ Note: (none)\n")
 	} else {
-		ioh.Printf(" ↳ Note: %s\n", q.Note)
+		ioh.Printf(" ↳ Note: %s\n", sanitizeControlChars(q.Note))
 	}
 }
 
 func (ioh *IOHandlerImpl) PrintQuestionDetail(question *core.Question) {
-	ioh.PrintfColored(ColorQuestionURL, "[%d] %s\n", question.ID, question.URL)
+	ioh.PrintfColored(ColorQuestionURL, "[%d] %s\n", question.ID, sanitizeControlChars(question.URL))
 	if question.Note == "" {
 		ioh.Printf(" ↳ Note: (none)\n")
 	} else {
-		ioh.Printf(" ↳ Note: %s\n", question.Note)
+		ioh.Printf(" ↳ Note: %s\n", sanitizeControlChars(question.Note))
 	}
 	ioh.Printf("   Familiarity: %d/%d\n", question.Familiarity+1, core.MaxFamiliarity)
 	ioh.Printf("   Importance: %d/%d\n", question.Importance+1, core.MaxImportance)
@@ -131,11 +168,11 @@ func (ioh *IOHandlerImpl) PrintQuestionUpsertDetail(delta *core.Delta) {
 	newState := delta.NewState
 	oldState := delta.OldState
 
-	ioh.PrintfColored(ColorQuestionURL, "[%d] %s\n", newState.ID, newState.URL)
+	ioh.PrintfColored(ColorQuestionURL, "[%d] %s\n", newState.ID, sanitizeControlChars(newState.URL))
 	if newState.Note == "" {
 		ioh.Printf(" ↳ Note: (none)\n")
 	} else {
-		ioh.Printf(" ↳ Note: %s\n", newState.Note)
+		ioh.Printf(" ↳ Note: %s\n", sanitizeControlChars(newState.Note))
 	}
 
 	if oldState == nil {
@@ -197,6 +234,15 @@ func (ioh *IOHandlerImpl) PrintError(err error) {
 		return
 	}
 
+	// Record last error for exit code mapping
+	ioh.lastErr = err
+
+	// JSON mode: output JSON envelope
+	if ioh.opt.JSON {
+		WriteJSONError(ioh.Writer, err)
+		return
+	}
+
 	// Check if it's a coded error
 	var codedErr *errs.CodedError
 	if errors.As(err, &codedErr) {
@@ -245,4 +291,19 @@ func (ioh *IOHandlerImpl) FormatTimeAgo(t time.Time) string {
 		}
 		return fmt.Sprintf("%d days ago", days)
 	}
+}
+
+// sanitizeControlChars replaces invisible control characters (except common whitespace)
+// with their Unicode replacement character to prevent terminal injection.
+func sanitizeControlChars(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsControl(r) && r != '\n' && r != '\r' && r != '\t' {
+			b.WriteRune(unicode.ReplacementChar)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }

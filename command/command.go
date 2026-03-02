@@ -91,11 +91,29 @@ type UpsertCommand struct {
 }
 
 func (c *UpsertCommand) Execute(scanner *bufio.Scanner, args []string) bool {
-	var rawURL string
-	if len(args) > 0 {
-		rawURL = args[0]
+	argSet, err := parseUpsertArgs(args)
+	if err != nil {
+		c.Handler.HandleUpsertNonInteractive(handler.UpsertNonInteractiveInput{
+			ParseError: err,
+		})
+		return false
 	}
-	c.Handler.HandleUpsert(scanner, rawURL)
+
+	if argSet.HasFlags {
+		c.Handler.HandleUpsertNonInteractive(handler.UpsertNonInteractiveInput{
+			URL:         argSet.URL,
+			Familiarity: argSet.Familiarity,
+			Importance:  argSet.Importance,
+			Memory:      argSet.Memory,
+			Note:        argSet.Note,
+		})
+	} else {
+		var rawURL string
+		if len(args) > 0 {
+			rawURL = args[0]
+		}
+		c.Handler.HandleUpsert(scanner, rawURL)
+	}
 	return false
 }
 
@@ -105,10 +123,18 @@ type DeleteCommand struct {
 
 func (c *DeleteCommand) Execute(scanner *bufio.Scanner, args []string) bool {
 	var target string
-	if len(args) > 0 {
-		target = args[0]
+	skipConfirm := false
+	for _, arg := range args {
+		switch arg {
+		case "--yes", "-y":
+			skipConfirm = true
+		default:
+			if target == "" {
+				target = arg
+			}
+		}
 	}
-	c.Handler.HandleDelete(scanner, target)
+	c.Handler.HandleDelete(scanner, target, skipConfirm)
 	return false
 }
 
@@ -117,7 +143,13 @@ type UndoCommand struct {
 }
 
 func (c *UndoCommand) Execute(scanner *bufio.Scanner, args []string) bool {
-	c.Handler.HandleUndo(scanner)
+	skipConfirm := false
+	for _, arg := range args {
+		if arg == "--yes" || arg == "-y" {
+			skipConfirm = true
+		}
+	}
+	c.Handler.HandleUndo(scanner, skipConfirm)
 	return false
 }
 
@@ -153,7 +185,7 @@ type HistoryCommand struct {
 }
 
 func (c *HistoryCommand) Execute(scanner *bufio.Scanner, args []string) bool {
-	c.Handler.HandleHistory()
+	c.Handler.HandleHistory(args)
 	return false
 }
 
